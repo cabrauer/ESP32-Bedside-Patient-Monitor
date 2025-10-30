@@ -1,0 +1,167 @@
+Machine Learning Expansion Roadmap
+This document outlines how to add machine learning to the bedside monitor for predictive patient health analysis.
+
+Why ML for Patient Monitoring?
+Current system: Reactive (alerts when something changes) ML-enhanced system: Predictive (alerts before problems occur)
+
+Examples: - Detect sleep deterioration before it becomes critical - Identify infection/fever patterns 24 hours early - Predict falls based on movement pattern changes - Distinguish normal nighttime activity from distressed behavior
+
+Phase 1: Data Foundation (Weeks 1-2)
+Logging Sensor Data
+Modify receiver to log energy data to SD card:
+
+```cpp
+
+include
+include
+define SD_CS_PIN 5
+File logFile; unsigned long lastLogTime = 0; const unsigned long LOG_INTERVAL = 60000; // Log every minute
+
+void setupSD() { if (!SD.begin(SD_CS_PIN)) { Serial.println("SD card failed"); return; }
+
+// Create daily log file char filename[20]; sprintf(filename, "/log_%ld.csv", millis() / 86400000); logFile = SD.open(filename, FILE_WRITE);
+
+if (logFile) { logFile.println("timestamp,stationaryEnergy,movingEnergy"); logFile.close(); } }
+
+void logData() { if (millis() - lastLogTime > LOG_INTERVAL) { logFile = SD.open("/log_*.csv", FILE_WRITE); if (logFile) { logFile.print(millis()); logFile.print(","); logFile.print(incomingData.stationaryEnergy); logFile.print(","); logFile.println(incomingData.movingEnergy); logFile.close(); lastLogTime = millis(); } } } ```
+
+What to Collect
+Log this data for 7-14 days per patient: - Timestamp - Stationary energy - Moving energy - Daily notes (patient condition, medications, alerts)
+
+Result: CSV file with ~1000-2000 data points per patient per day
+
+Phase 2: Pattern Analysis (Weeks 2-3)
+Desktop Analysis (Python)
+Analyze logged CSV files offline:
+
+```python import pandas as pd import numpy as np from datetime import datetime
+
+Load patient data
+df = pd.read_csv('log_patient1.csv') df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+Calculate hourly statistics
+df['hour'] = df['timestamp'].dt.hour hourly = df.groupby('hour').agg({ 'stationaryEnergy': ['mean', 'std'], 'movingEnergy': ['mean', 'std'] })
+
+print("Typical Activity by Hour:") print(hourly)
+
+Detect anomalies (activity >2 std devs from mean)
+df['stationary_zscore'] = np.abs((df['stationaryEnergy'] - df['stationaryEnergy'].mean()) / df['stationaryEnergy'].std()) anomalies = df[df['stationary_zscore'] > 2]
+
+print(f"\nDetected {len(anomalies)} anomalous events") ```
+
+Patterns to Look For
+Sleep Schedule: When does activity drop to baseline?
+Activity Rhythm: Peak movement times
+Baseline Energy: What's normal for this patient?
+Variability: How noisy is the signal?
+Unusual Events: Late night spikes, sudden drops
+Phase 3: Simple Threshold Alerts (Weeks 3-4)
+Patient-Specific Baseline Detection
+Once you have 7 days of data, implement adaptive alerts:
+
+```cpp // On receiver, store patient baseline const uint16_t HOURLY_BASELINE[24] = { // Values from averaging your 7-day data // [0]=midnight, [6]=6am, [12]=noon, [23]=11pm 5, 4, 3, 2, 2, 3, 15, 45, 60, 55, 50, 45, 50, 55, 60, 65, 60, 50, 40, 30, 20, 15, 10, 8 };
+
+void checkAnomalies() { uint8_t currentHour = (millis() / 3600000) % 24; uint16_t expectedActivity = HOURLY_BASELINE[currentHour]; uint16_t totalEnergy = incomingData.stationaryEnergy + incomingData.movingEnergy;
+
+// Alert if activity is <50% of expected for 30+ minutes if (totalEnergy < (expectedActivity / 2)) { consecutiveAnomalyCount++; if (consecutiveAnomalyCount > 30) { // 30 × 100ms updates ≈ 3 seconds triggerCaregiverAlert("Activity lower than expected"); consecutiveAnomalyCount = 0; } } else { consecutiveAnomalyCount = 0; } } ```
+
+Phase 4: TinyML on Device (Weeks 4-6)
+Using Edge Impulse (Easiest Path)
+Collect labeled data:
+1 week: "Patient sleeping" data
+1 week: "Patient awake" data
+1 week: "Patient distressed" or "unusual movement" data
+
+Upload to Edge Impulse (edge-impulse.com):
+
+Create free account
+Import your CSV logs
+Label 1-minute segments with categories
+
+Create ML Model:
+
+Edge Impulse → Create impulse
+Add "Raw Data" processing block
+Add "Neural Network" learning block
+Deploy as Arduino library (.zip)
+
+Run on ESP32: ```cpp #include
+
+void setup() { ei_printf("Edge Impulse inferencing engine loaded\n\r"); }
+
+void loop() { // Collect 60 samples (1 minute of data) signal_t signal; signal.total_length = 60; signal.get_data = &get_sensor_data;
+
+ // Run inference
+ ei_impulse_result_t result = {0};
+ run_classifier(&signal, &result, debug_nn);
+
+ // Check prediction confidence
+ if (result.classification[0].value > 0.8) {
+   Serial.println("Patient sleeping");
+ } else if (result.classification[1].value > 0.8) {
+   Serial.println("Patient moving");
+ }
+} ```
+
+Phase 5: Advanced Predictive Models (Weeks 6-8)
+Cloud-Based Analysis (Optional)
+For more sophisticated predictions, send data to cloud:
+
+cpp // Send data to Firebase/AWS every 5 minutes void sendToCloud() { // Pseudo-code HTTPClient http; String json = "{\"static\":" + String(avgStationary) + ",\"moving\":" + String(avgMoving) + ",\"timestamp\":" + String(millis()) + "}"; http.POST("https://your-api.com/patient-data", json); }
+
+Then use Python/TensorFlow for server-side analysis: - Multi-day trend detection - Infection/fever pattern matching - Fall risk assessment - Medication impact analysis
+
+Example Use Cases
+1. Infection Detection
+Pattern: Increased nighttime movement, reduced daytime activity
+
+```python
+
+Analyze circadian shift
+night_activity = df[df['hour'].isin([22,23,0,1,2,3])]['movingEnergy'].mean() day_activity = df[df['hour'].isin([8,9,10,11,12,13])]['movingEnergy'].mean()
+
+if night_activity > day_activity * 1.5: print("Alert: Possible infection (reversed circadian rhythm)") ```
+
+2. Fall Risk
+Pattern: Sudden drop from high to low energy, followed by immobility
+
+```python
+
+Detect sudden movement cessation
+df['energy_drop'] = df['movingEnergy'].diff() rapid_stops = df[df['energy_drop'] < -50]
+
+if len(rapid_stops) > 3 and df['stationaryEnergy'].iloc[-5:].mean() < 5: print("Alert: Possible fall detected") ```
+
+3. Delirium (Altered Mental Status)
+Pattern: Chaotic, fragmented sleep; unusual nighttime activity spikes
+
+```python
+
+Measure sleep fragmentation
+sleep_blocks = identify_sleep_periods(df) fragmentation = calculate_fragmentation(sleep_blocks)
+
+if fragmentation > normal_fragmentation * 2: print("Alert: Possible acute delirium") ```
+
+4. Depression/Withdrawal
+Pattern: Sustained reduction in all activity across all hours
+
+```python
+
+Compare to baseline
+current_avg = df['movingEnergy'].mean() baseline_avg = previous_week_df['movingEnergy'].mean()
+
+if current_avg < baseline_avg * 0.6: print("Alert: Significant activity decline (depression risk)") ```
+
+Implementation Checklist
+[ ] Set up SD card logging on receiver
+[ ] Collect 7-14 days baseline data per patient
+[ ] Analyze patterns in Python
+[ ] Implement hourly baseline thresholds (Phase 3)
+[ ] Create Edge Impulse project with labeled data
+[ ] Deploy TinyML model to ESP32
+[ ] Test in real patient environment
+[ ] Gather feedback from caregiver
+[ ] Refine thresholds based on use
+Resources
+Edge Impulse: edge-impulse.com (free ML for embedded)
+TensorFlow Lite Micro: 
