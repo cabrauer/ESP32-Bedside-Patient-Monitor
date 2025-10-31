@@ -1,0 +1,339 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <FastLED.h>
+#include <SPIFFS.h>
+#include <math.h>
+
+#define LED_PIN     32
+#define NUM_LEDS    64
+#define BRIGHTNESS  64
+#define LED_TYPE    WS2812B
+#define COLOR_ORDER GRB
+
+CRGB leds[NUM_LEDS];
+
+// ========== TIMING CONSTANTS ==========
+#define UPDATE_INTERVAL      100
+#define TIMEOUT              3000
+#define TIME_TO_FULL         10000
+#define FLASH_PERIOD         500
+#define ENERGY_THRESHOLD     10
+#define OUTER_MULTIPLIER     1.8f
+#define INNER_MULTIPLIER     1.8f
+
+// ========== LOGGING CONSTANTS ==========
+#define LOG_INTERVAL         500      // Log every 500ms
+#define MAX_LOG_SIZE         500000   // ~500KB max per file
+#define SPIFFS_SIZE          1500000  // 1.5MB available
+
+// Ring definitions
+const uint8_t outerRing[] = {
+  0, 1, 2, 3, 4, 5, 6, 7,
+  8, 23, 24, 39, 40, 55,
+  56, 57, 58, 59, 60, 61, 62, 63,
+  48, 47, 32, 31, 16, 15
+};
+
+const uint8_t innerRing[] = {
+  14, 13, 12, 11, 10, 9,
+  22, 25, 38, 41, 54,
+  53, 52, 51, 50, 49,
+  46, 33, 30, 17
+};
+
+const uint8_t centerRing[] = {
+  18, 19, 20, 21,
+  26, 27, 28, 29,
+  34, 35, 36, 37,
+  42, 43, 44, 45
+};
+
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t stationaryEnergy;
+  uint16_t movingEnergy;
+  uint32_t ts_ms;
+} SensorData;
+#pragma pack(pop)
+
+SensorData incomingData;
+uint32_t packetCount = 0;
+unsigned long lastUpdate = 0;
+unsigned long lastEnergyTime = 0;
+unsigned long lastLogTime = 0;
+bool quietMode = false;
+
+char currentLogFile[32] = "";
+uint32_t fileSize = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Initialize SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  } else {
+    Serial.println("SPIFFS mounted");
+    initializeLogging();
+  }
+  
+  // FastLED setup
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.clear();
+  FastLED.show();
+  
+  // ESP-NOW setup
+  WiFi.mode(WIFI_STA);
+  Serial.print("Receiver MAC: ");
+  Serial.println(WiFi.macAddress());
+  
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("Receiver Ready. Waiting for sensor data...");
+  Serial.println("Commands: TYPE 'dump' TO DOWNLOAD DATA, 'delete' TO CLEAR, 'list' TO SEE FILES");
+  
+  lastEnergyTime = millis();
+}
+
+// ========== LOGGING FUNCTIONS ==========
+
+void initializeLogging() {
+  // Create filename based on current millis (acts as date)
+  // Format: /log_MMDDYYYY.csv (using millis as pseudo-date)
+  uint32_t dayKey = (millis() / 86400000); // Day number since startup
+  sprintf(currentLogFile, "/log_%04d.csv", dayKey % 10000);
+  
+  // Check if file exists
+  if (!SPIFFS.exists(currentLogFile)) {
+    File f = SPIFFS.open(currentLogFile, "w");
+    if (f) {
+      // Write header
+      f.println("timestamp_ms,stationary_energy,moving_energy,packet_num");
+      f.close();
+      fileSize = 0;
+      Serial.print("Created new log file: ");
+      Serial.println(currentLogFile);
+    }
+  } else {
+    Serial.print("Appending to log file: ");
+    Serial.println(currentLogFile);
+  }
+}
+
+void logSensorData() {
+  if (millis() - lastLogTime < LOG_INTERVAL) {
+    return; // Not time to log yet
+  }
+  
+  lastLogTime = millis();
+  
+  File f = SPIFFS.open(currentLogFile, "a");
+  if (f) {
+    char buffer[80];
+    sprintf(buffer, "%lu,%d,%d,%lu\n",
+            millis(),
+            incomingData.stationaryEnergy,
+            incomingData.movingEnergy,
+            packetCount);
+    
+    f.print(buffer);
+    fileSize += strlen(buffer);
+    f.close();
+    
+    // Check if file is getting too large, rotate if needed
+    if (fileSize > MAX_LOG_SIZE) {
+      Serial.println("Log file size limit reached, starting new file");
+      initializeLogging();
+    }
+  }
+}
+
+void dumpDataToSerial() {
+  Serial.println("\n========== DATA DUMP ==========");
+  Serial.print("File: ");
+  Serial.println(currentLogFile);
+  
+  File f = SPIFFS.open(currentLogFile, "r");
+  if (f) {
+    Serial.println("timestamp_ms,stationary_energy,moving_energy,packet_num");
+    
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      Serial.println(line);
+    }
+    f.close();
+    Serial.println("========== END DUMP ==========\n");
+  } else {
+    Serial.println("No log file found!");
+  }
+}
+
+void listAllFiles() {
+  Serial.println("\n========== FILES ON SPIFFS ==========");
+  
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  
+  int fileCount = 0;
+  uint32_t totalSize = 0;
+  
+  while (file) {
+    Serial.print("File: ");
+    Serial.print(file.name());
+    Serial.print(" | Size: ");
+    Serial.print(file.size());
+    Serial.println(" bytes");
+    
+    totalSize += file.size();
+    fileCount++;
+    file = root.openNextFile();
+  }
+  
+  Serial.print("Total files: ");
+  Serial.println(fileCount);
+  Serial.print("Total size: ");
+  Serial.print(totalSize);
+  Serial.println(" bytes");
+  Serial.println("=====================================\n");
+}
+
+void deleteAllLogs() {
+  Serial.println("Deleting all log files...");
+  
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  
+  while (file) {
+    String filename = file.name();
+    if (filename.startsWith("/log_")) {
+      SPIFFS.remove(filename);
+      Serial.print("Deleted: ");
+      Serial.println(filename);
+    }
+    file = root.openNextFile();
+  }
+  
+  Serial.println("All logs deleted!");
+  initializeLogging();
+}
+
+void checkSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.toLowerCase();
+    command.trim();
+    
+    if (command == "dump") {
+      quietMode = true;  // Suppress output during dump
+      dumpDataToSerial();
+      quietMode = false;
+    } 
+    else if (command == "delete") {
+      deleteAllLogs();
+    } 
+    else if (command == "list") {
+      listAllFiles();
+    }
+    else if (command == "quiet") {
+      quietMode = !quietMode;
+      Serial.print("Quiet mode: ");
+      Serial.println(quietMode ? "ON" : "OFF");
+    }
+    else if (command == "help") {
+      Serial.println("\nCommands:");
+      Serial.println("  dump   - Print all logged data to serial");
+      Serial.println("  list   - Show all files on SPIFFS");
+      Serial.println("  delete - Delete all log files");
+      Serial.println("  quiet  - Toggle quiet mode (stop printing sensor data)");
+      Serial.println("  help   - Show this message\n");
+    }
+  }
+}
+
+// ========== MATRIX DISPLAY FUNCTIONS ==========
+
+void updateMatrix() {
+  if (millis() - lastUpdate > TIMEOUT) {
+    FastLED.clear();
+    FastLED.show();
+    return;
+  }
+  
+  FastLED.clear();
+  
+  int outerLit = constrain((int)(sqrtf(incomingData.stationaryEnergy) * OUTER_MULTIPLIER), 0, sizeof(outerRing) / sizeof(outerRing[0]));
+  int innerLit = constrain((int)(sqrtf(incomingData.movingEnergy + 1) * INNER_MULTIPLIER), 0, sizeof(innerRing) / sizeof(innerRing[0]));
+  
+  for (int i = 0; i < outerLit; i++) {
+    leds[outerRing[i]] = CRGB(0, 64, 0);
+  }
+  
+  for (int i = 0; i < innerLit; i++) {
+    leds[innerRing[i]] = CRGB(0, 0, 64);
+  }
+  
+  if (incomingData.stationaryEnergy < ENERGY_THRESHOLD && incomingData.movingEnergy < ENERGY_THRESHOLD) {
+    unsigned long timeSinceEnergy = millis() - lastEnergyTime;
+    
+    if (timeSinceEnergy < TIME_TO_FULL) {
+      uint8_t brightness = (timeSinceEnergy * 255) / TIME_TO_FULL;
+      CRGB centerColor = CRGB(brightness, 0, 0);
+      
+      for (int i = 0; i < sizeof(centerRing) / sizeof(centerRing[0]); i++) {
+        leds[centerRing[i]] = centerColor;
+      }
+    } else {
+      uint8_t flashBrightness = (millis() % FLASH_PERIOD) < (FLASH_PERIOD / 2) ? 255 : 64;
+      CRGB centerColor = CRGB(flashBrightness, 0, 0);
+      
+      for (int i = 0; i < sizeof(centerRing) / sizeof(centerRing[0]); i++) {
+        leds[centerRing[i]] = centerColor;
+      }
+    }
+  }
+  
+  FastLED.show();
+}
+
+void loop() {
+  checkSerialCommands();
+  
+  if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+    lastUpdate = millis();
+    updateMatrix();
+  }
+  
+  // Log data to SPIFFS
+  logSensorData();
+}
+
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+#else
+void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
+#endif
+  if (len == sizeof(SensorData)) {
+    memcpy(&incomingData, data, sizeof(SensorData));
+    packetCount++;
+    lastUpdate = millis();
+    
+    if (incomingData.movingEnergy > ENERGY_THRESHOLD || incomingData.stationaryEnergy > ENERGY_THRESHOLD) {
+      lastEnergyTime = millis();
+    }
+    
+    // Only print if not in quiet mode
+    if (!quietMode) {
+      Serial.printf("[%lu] Static: %d, Moving: %d\n",
+                    packetCount,
+                    incomingData.stationaryEnergy,
+                    incomingData.movingEnergy);
+    }
+  } else {
+    Serial.println("Invalid packet size");
+  }
+}
